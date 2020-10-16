@@ -8,13 +8,10 @@ output:
     theme: simplex
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 Start by loading the libraries and reading in the data. Note that the dataset is from Kaggle, the [US Consumer Finance Complaints dataset](https://www.kaggle.com/cfpb/us-consumer-finance-complaints). You can do a direct download via the Kaggle API, but I didn't bother and instead just downloaded it manually. 
 
-```{r}
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
 library(textrecipes)
 library(tidymodels)
 library(tidytext)
@@ -32,6 +29,8 @@ DBI::dbDisconnect(sqlite_conn)
 head(complaints)
 ```
 
+Some examples of how the money values are stored in the narrative column. 
+
 ```{r}
 complaints %>% 
     filter(str_detect(consumer_complaint_narrative, 
@@ -42,10 +41,15 @@ complaints %>%
     head()
 ```
 
+Now set up the partitions ready to build a model. 
+
 ```{r}
 set.seed(1234)
 complaints2class <- complaints %>%
-    mutate(product = factor(if_else(product == "Credit reporting, credit repair services, or other personal consumer reports", "Credit", "Other"))) %>% 
+    mutate(product = factor(if_else(product %in% c("Credit reporting", 
+                                                   "Credit card"), 
+                                    "Credit", 
+                                    "Other"))) %>% 
     mutate(across(date_received, lubridate::mdy))
 
 complaints_split <- initial_split(complaints2class, strata = product)
@@ -54,10 +58,11 @@ complaints_train <- training(complaints_split)
 complaints_test <- testing(complaints_split)
 ```
 
+The recipe is the heart of the text part really. Here is where we define the processing steps. 
+
 ```{r}
 complaints_rec <- recipe(
-    product ~ date_received + tags + 
-        consumer_complaint_narrative,
+    product ~ date_received + tags + consumer_complaint_narrative,
     data = complaints_train
 ) %>% 
     step_date(date_received, features = c("month", "dow"), role = "dates") %>% 
@@ -71,7 +76,121 @@ complaints_rec <- recipe(
     step_tfidf(consumer_complaint_narrative)
 ```
 
+You'll notice that runs in basically no time at all, because it just _specifies_ the steps rather than actually doing them. Calling `prep()` would run these steps and stores them, ready to apply on any dataset. What's nice is that we don't need to bother calling it directly, it will be done automatically at the point of fitting models later. 
+
+We then create a specification of a naïve Bayes model. 
+
 ```{r}
-complaints_prep <- complaints_rec %>% prep()
+nb_spec <- naive_Bayes() %>% 
+  set_mode("classification") %>% 
+  set_engine("naivebayes")
+nb_spec
+```
+
+One other convenience of tidymodels is the `workflow()`, which is a container for a recipe plus model spec. It makes a lot of the other stuff easier. 
+
+```{r}
+nb_wfl <- workflow() %>% 
+  add_recipe(complaints_rec) %>% 
+  add_model(nb_spec)
+nb_wfl
+```
+
+Now we can fit the model by calling `fit()` on that workflow object. 
+
+```{r}
+nb_fit <- nb_wfl %>% 
+  fit(data = complaints_train)
+```
+
+Now set up some cross-validation folds to estimate model performance, and then fit the model to that resampling structure. 
+
+```{r}
+complaints_folds <- vfold_cv(complaints_train, 
+                             v = 5, 
+                             strata = product)
+```
+
+
+```{r}
+nb_cv <- fit_resamples(
+  nb_wfl,
+  resamples = complaints_folds,
+  control = control_resamples(verbose = TRUE, 
+                              save_pred = TRUE)
+)
+```
+
+Can pull out the metrics and predictions. 
+
+```{r}
+nb_cv_metrics <- collect_metrics(nb_cv)
+nb_cv_predictions <- collect_predictions(nb_cv)
+```
+
+The metrics are just in a tibble, easy to inspect or manipulate. 
+
+```{r}
+nb_cv_metrics
+```
+
+Can also plot the roc curves for each fold, see how it's doing. 
+
+```{r}
+nb_cv_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = product, .pred_Credit) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "Receiver operator curve for US Consumer Finance Complaints",
+    subtitle = "Each resample fold is shown in a different color"
+  )
+```
+
+It's OK, but not great. The pipeline works though! We can also look at the confusion matrices to see in which directions the model is failing to perform, here it is for one fold.  
+
+```{r}
+nb_cv_predictions %>%
+  filter(id == "Fold1") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+It seems that basically the model is 'cheating' by predicting the majority class all the time. Is this true in another fold?
+
+```{r}
+nb_cv_predictions %>%
+  filter(id == "Fold3") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+Yes, the model is definitely cheating. Could potentially fix this with some strategy for dealing with imbalanced classes, but this will do for now. 
+
+We can now try our model again on the test data and see how it performs. 
+
+```{r}
+nb_preds <- predict(nb_fit, 
+                    new_data = complaints_test) %>% 
+  # Need to add the column for the true labels
+  bind_cols(complaints_test %>% select(product))
+```
+
+Can then compute the desired metrics on our predictions. 
+
+```{r}
+map_dfr(
+  list(precision, recall, accuracy), 
+  ~ .x(nb_preds, truth = product, estimate = .pred_class)
+)
+```
+
+Precision and accuracy are decent but the recall is terrible. Same problem as we had in the training data. The confusion matrix tells the same story. 
+
+```{r}
+nb_preds %>% 
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap")
 ```
 
