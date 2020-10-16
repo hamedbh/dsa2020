@@ -1,0 +1,77 @@
+---
+title: "Simple text classification"
+author: "Hamed Bastan-Hagh"
+date: "15 Oct 2020"
+output: 
+  html_document: 
+    highlight: textmate
+    theme: simplex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Start by loading the libraries and reading in the data. Note that the dataset is from Kaggle, the [US Consumer Finance Complaints dataset](https://www.kaggle.com/cfpb/us-consumer-finance-complaints). You can do a direct download via the Kaggle API, but I didn't bother and instead just downloaded it manually. 
+
+```{r}
+library(textrecipes)
+library(tidymodels)
+library(tidytext)
+library(stringr)
+library(discrim)
+library(readr)
+```
+
+```{r}
+sqlite_conn <- DBI::dbConnect(RSQLite::SQLite(), "data/database.sqlite")
+complaints <- tbl(sqlite_conn, 
+             "consumer_complaints") %>% 
+    collect()
+DBI::dbDisconnect(sqlite_conn)
+head(complaints)
+```
+
+```{r}
+complaints %>% 
+    filter(str_detect(consumer_complaint_narrative, 
+                      "\\{\\$[0-9\\.]*\\}")) %>% 
+    pull(consumer_complaint_narrative) %>% 
+    str_extract_all("\\{\\$[0-9\\.]*\\}") %>% 
+    compact() %>% 
+    head()
+```
+
+```{r}
+set.seed(1234)
+complaints2class <- complaints %>%
+    mutate(product = factor(if_else(product == "Credit reporting, credit repair services, or other personal consumer reports", "Credit", "Other"))) %>% 
+    mutate(across(date_received, lubridate::mdy))
+
+complaints_split <- initial_split(complaints2class, strata = product)
+
+complaints_train <- training(complaints_split)
+complaints_test <- testing(complaints_split)
+```
+
+```{r}
+complaints_rec <- recipe(
+    product ~ date_received + tags + 
+        consumer_complaint_narrative,
+    data = complaints_train
+) %>% 
+    step_date(date_received, features = c("month", "dow"), role = "dates") %>% 
+    step_rm(date_received) %>% 
+    step_dummy(has_role("dates")) %>% 
+    step_unknown(tags) %>% 
+    step_dummy(tags) %>% 
+    step_tokenize(consumer_complaint_narrative) %>% 
+    step_stopwords(consumer_complaint_narrative) %>% 
+    step_tokenfilter(consumer_complaint_narrative) %>% 
+    step_tfidf(consumer_complaint_narrative)
+```
+
+```{r}
+complaints_prep <- complaints_rec %>% prep()
+```
+
